@@ -185,6 +185,28 @@ impl Ignore {
         })
     }
 
+    /// Return a copy of this matcher that doesn't share its cache of compiled
+    /// parent directory matchers with any other matcher.
+    ///
+    /// This is used to reload ignore rules from disk without disturbing
+    /// sibling matchers built from the same builder. Namely, `add_parents`
+    /// normally consults (and populates) a cache of compiled parent matchers
+    /// shared by every matcher derived from the same root. A matcher built
+    /// from the copy returned here uses a private cache instead, so it
+    /// neither observes stale parent matchers compiled before the copy was
+    /// made nor leaks freshly compiled parent matchers into matchers that
+    /// haven't been reloaded.
+    pub(crate) fn with_fresh_parent_cache(&self) -> Ignore {
+        let inner = IgnoreInner {
+            compiled: Arc::new(RwLock::new(HashMap::new())),
+            ..(*self.inner).clone()
+        };
+        Ignore {
+            inner: Arc::new(inner),
+            absolute_base: self.absolute_base.clone(),
+        }
+    }
+
     /// Create a new `Ignore` matcher with the parent directories of `dir`.
     ///
     /// Note that this can only be called on an `Ignore` matcher with no

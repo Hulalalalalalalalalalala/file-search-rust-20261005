@@ -28,8 +28,12 @@ use crate::{
 /// maximum file size are applied.
 ///
 /// A matcher is a snapshot at directory granularity. Once the ignore files in
-/// a directory have been loaded, edits to those files are not observed. Build
-/// a new matcher to reload them.
+/// a directory have been loaded, edits to those files are not observed until
+/// [`IncrementalIgnore::refresh`] is called. Refreshing discards every loaded
+/// matcher and cached directory judgment, so that subsequent queries read
+/// ignore files from disk again. Refreshing only affects the matcher it is
+/// called on; other matchers built from the same [`crate::WalkBuilder`], and
+/// clones made before the refresh, keep their already loaded rules.
 ///
 /// # Warning
 ///
@@ -59,8 +63,22 @@ pub struct IncrementalIgnore {
     root: PathBuf,
     /// The normalized root used only by the opt-in normalization routine.
     normalized_root: OnceLock<Option<PathBuf>>,
+    /// The base matcher as it was built, before any directory was loaded.
+    ///
+    /// This is retained so that `refresh` can start loading again from a
+    /// clean slate. Its compiled parent matchers are shared with sibling
+    /// matchers built from the same `WalkBuilder`, so refreshing uses a copy
+    /// with a private parent cache.
+    base: Ignore,
     /// The matcher for the configured root directory, loaded on first use.
     ignore: RootIgnore,
+    /// Root matchers retired by `refresh`, kept alive so that sibling
+    /// matchers built from the same `WalkBuilder` keep observing the parent
+    /// rules they would have seen without the refresh. Namely, the compiled
+    /// parent cache shared with those siblings only holds weak references,
+    /// so dropping a retired chain would let an unrefreshed sibling reload
+    /// parent ignore files from disk and observe newer rules.
+    retired: Vec<Ignore>,
     /// Directory paths relative to `root`, excluding the root itself.
     dirs: HashMap<PathBuf, CachedDir>,
     /// Options for additional filtering beyond gitignore.
@@ -116,15 +134,17 @@ impl IncrementalIgnore {
         //
         // If callers need to search a file or directory named `-`, then they
         // can use `./-`. As is the case for file traversal too.
-        let ignore = if root == Path::new("-") {
+        let root_ignore = if root == Path::new("-") {
             RootIgnore::Stdin
         } else {
-            RootIgnore::Unloaded(ignore)
+            RootIgnore::Unloaded(ignore.clone())
         };
         IncrementalIgnore {
             root,
             normalized_root: OnceLock::new(),
-            ignore,
+            base: ignore,
+            ignore: root_ignore,
+            retired: Vec::new(),
             dirs: HashMap::new(),
             options,
         }
@@ -133,6 +153,46 @@ impl IncrementalIgnore {
     /// Return the root that paths matched by this matcher are relative to.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Discard all ignore rules and directory judgments loaded so far, so
+    /// that subsequent queries read ignore files from disk again.
+    ///
+    /// This covers the ignore files in the configured root, in any applicable
+    /// parent directories outside the root and in every subdirectory
+    /// previously loaded by this matcher, including `.ignore`, `.gitignore`
+    /// and any custom ignore file names configured on the builder. Ignore
+    /// files that were added, modified or deleted since they were first
+    /// loaded (or since the last refresh) are all observed by the next query,
+    /// as are changes to repository boundaries such as the presence of a
+    /// `.git` or `.jj` directory. Cached judgments about whether a directory
+    /// may be descended into are discarded as well, so a directory that was
+    /// previously ignored (or allowed) is re-evaluated against the freshly
+    /// loaded rules.
+    ///
+    /// Refreshing does not traverse the directory tree and does not install
+    /// any file system watching. Loading still happens lazily: the first
+    /// query after a refresh reads the ignore files it needs from disk, and
+    /// edits made after that point require another refresh to be observed.
+    ///
+    /// Only this matcher is refreshed. Other matchers built from the same
+    /// [`crate::WalkBuilder`] and clones of this matcher made before the
+    /// refresh keep the rules they have already loaded, even for parent
+    /// directories shared with this matcher. The configured root and all
+    /// filtering options are left untouched, as are global and explicitly
+    /// added ignore rules, which keep the version captured when the matcher
+    /// was built. A matcher for the special `-` root representing standard
+    /// input is inert and refreshing it has no effect.
+    pub fn refresh(&mut self) {
+        if matches!(self.ignore, RootIgnore::Stdin) {
+            return;
+        }
+        if let RootIgnore::Loaded(ref ignore) = self.ignore {
+            self.retired.push(ignore.clone());
+        }
+        self.ignore =
+            RootIgnore::Unloaded(self.base.with_fresh_parent_cache());
+        self.dirs.clear();
     }
 
     /// Normalize `path` and return it relative to this matcher's root.
@@ -1282,5 +1342,299 @@ mod tests {
         let dir = matchedd(&mut m, "a/.hidden");
         assert!(dir.is_ignore());
         assert!(!dir.is_within_depth());
+    }
+
+    // Test that refresh picks up edits to an already loaded ignore file, and
+    // that edits made after the refreshed load still require another refresh.
+    #[test]
+    fn refresh_reloads_changed_ignore_files() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a"));
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "a/first.tmp").is_ignore());
+
+        // Without a refresh, the edit is not observed.
+        wfile(td.path().join("a/.ignore"), "!*.tmp\n*.rs\n");
+        assert!(matchedf(&mut m, "a/first.tmp").is_ignore());
+
+        m.refresh();
+        assert!(matchedf(&mut m, "a/first.tmp").is_whitelist());
+        assert!(matchedf(&mut m, "a/keep.rs").is_ignore());
+
+        // The refreshed rules are cached too: another edit is not observed
+        // until the next refresh.
+        wfile(td.path().join("a/.ignore"), "*.log\n");
+        assert!(matchedf(&mut m, "a/first.tmp").is_whitelist());
+        m.refresh();
+        assert!(matchedf(&mut m, "a/first.tmp").is_none());
+        assert!(matchedf(&mut m, "a/x.log").is_ignore());
+    }
+
+    // Test that refresh observes ignore files that were added or deleted,
+    // including custom ignore file names.
+    #[test]
+    fn refresh_observes_added_and_deleted_ignore_files() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a"));
+
+        let mut b = builder(td.path());
+        b.add_custom_ignore_filename(".rgignore");
+        let mut m = one_matcher(&b);
+        assert!(matchedf(&mut m, "a/x.tmp").is_none());
+        assert!(matchedf(&mut m, "a/x.svg").is_none());
+
+        // New ignore files appear after a refresh.
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+        wfile(td.path().join("a/.rgignore"), "*.svg\n");
+        assert!(matchedf(&mut m, "a/x.tmp").is_none());
+        m.refresh();
+        assert!(matchedf(&mut m, "a/x.tmp").is_ignore());
+        assert!(matchedf(&mut m, "a/x.svg").is_ignore());
+
+        // Deleting them is observed after a refresh too.
+        std::fs::remove_file(td.path().join("a/.ignore")).unwrap();
+        m.refresh();
+        assert!(matchedf(&mut m, "a/x.tmp").is_none());
+        assert!(matchedf(&mut m, "a/x.svg").is_ignore());
+    }
+
+    // Test that refresh re-reads ignore files in the root and in parent
+    // directories outside the root.
+    #[test]
+    fn refresh_reloads_root_and_parent_rules() {
+        let td = tmpdir();
+        let root = td.path().join("project/work");
+        mkdirp(&root);
+        wfile(td.path().join("project/.ignore"), "*.tmp\n");
+        wfile(root.join(".ignore"), "*.log\n");
+
+        let mut m = one_matcher(&builder(&root));
+        assert!(matchedf(&mut m, "x.tmp").is_ignore());
+        assert!(matchedf(&mut m, "x.log").is_ignore());
+
+        wfile(td.path().join("project/.ignore"), "");
+        wfile(root.join(".ignore"), "*.log\n*.rs\n");
+        m.refresh();
+        assert!(matchedf(&mut m, "x.tmp").is_none());
+        assert!(matchedf(&mut m, "x.log").is_ignore());
+        assert!(matchedf(&mut m, "x.rs").is_ignore());
+    }
+
+    // Test that refresh re-detects repository boundaries, so that gitignore
+    // rules start (and stop) applying when a `.git` directory appears (or
+    // disappears).
+    #[test]
+    fn refresh_redetects_repo_boundaries() {
+        let td = tmpdir();
+        wfile(td.path().join(".gitignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "foo").is_none());
+
+        mkdirp(td.path().join(".git"));
+        assert!(matchedf(&mut m, "foo").is_none());
+        m.refresh();
+        assert!(matchedf(&mut m, "foo").is_ignore());
+
+        std::fs::remove_dir(td.path().join(".git")).unwrap();
+        m.refresh();
+        assert!(matchedf(&mut m, "foo").is_none());
+    }
+
+    // Test that removing a rule that blocked a directory lets its children be
+    // re-evaluated against the directory's own rules after a refresh.
+    #[test]
+    fn refresh_unblocks_directory_after_rule_removal() {
+        let td = tmpdir();
+        mkdirp(td.path().join("blocked"));
+        wfile(td.path().join(".ignore"), "blocked/\n");
+        wfile(td.path().join("blocked/.ignore"), "!keep.rs\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "blocked/keep.rs").is_ignore());
+        assert!(matchedf(&mut m, "blocked/other.rs").is_ignore());
+
+        wfile(td.path().join(".ignore"), "");
+        m.refresh();
+        assert!(matchedf(&mut m, "blocked/keep.rs").is_whitelist());
+        assert!(matchedf(&mut m, "blocked/other.rs").is_none());
+    }
+
+    // Test that adding a rule that blocks a directory stops using the old
+    // whitelist rules inside it, and that ignore files inside the blocked
+    // directory are not even read (so their parse errors are not reported).
+    #[test]
+    fn refresh_blocked_directory_rules_are_not_read() {
+        let td = tmpdir();
+        mkdirp(td.path().join("open"));
+        wfile(td.path().join("open/.ignore"), "!keep.rs\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "open/keep.rs").is_whitelist());
+        assert!(matchedf(&mut m, "open/other.rs").is_none());
+
+        // Block the directory and make its ignore file invalid. Neither the
+        // whitelist nor the parse error may leak through.
+        wfile(td.path().join(".ignore"), "open/\n");
+        wfile(td.path().join("open/.ignore"), "!keep.rs\n{bad\n");
+        m.refresh();
+        let (matched, err) = m.matched_with_errors("open/keep.rs", false);
+        assert!(matched.is_ignore());
+        assert!(err.is_none(), "unexpected error: {err:?}");
+        assert!(matchedf(&mut m, "open/other.rs").is_ignore());
+    }
+
+    // Test that refreshing one matcher doesn't affect other matchers built
+    // from the same builder, even when they share parent directories, and
+    // that clones made before a refresh keep the old rules.
+    #[test]
+    fn refresh_only_affects_called_matcher() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a/b/c"));
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+
+        let mut mats = matchers(&builders([
+            td.path().join("a/b"),
+            td.path().join("a/b/c"),
+        ]));
+        // Load the shared parent rules through the first matcher only.
+        assert!(matchedf(&mut mats[0], "first.tmp").is_ignore());
+        let clone = mats[0].clone();
+
+        wfile(td.path().join("a/.ignore"), "!*.tmp\n");
+        mats[0].refresh();
+        assert!(matchedf(&mut mats[0], "first.tmp").is_whitelist());
+
+        // The clone made before the refresh keeps the old rules.
+        let mut stale = clone;
+        assert!(matchedf(&mut stale, "first.tmp").is_ignore());
+        // The sibling matcher hasn't queried anything yet, but the shared
+        // parent rules were already loaded, so it must not observe the new
+        // version because of the other matcher's refresh.
+        assert!(matchedf(&mut mats[1], "first.tmp").is_ignore());
+        assert!(matchedf(&mut mats[1], "d/first.tmp").is_ignore());
+
+        // Each matcher can be refreshed independently.
+        mats[1].refresh();
+        assert!(matchedf(&mut mats[1], "first.tmp").is_whitelist());
+        assert!(matchedf(&mut mats[0], "first.tmp").is_whitelist());
+    }
+
+    // Test that matchers with overlapping roots don't affect each other when
+    // only one of them is refreshed.
+    #[test]
+    fn refresh_overlapping_roots_are_independent() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a/b"));
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+
+        let mut mats =
+            matchers(&builders([td.path().join("a"), td.path().join("a/b")]));
+        assert!(matchedf(&mut mats[0], "b/x.tmp").is_ignore());
+        assert!(matchedf(&mut mats[1], "x.tmp").is_ignore());
+
+        wfile(td.path().join("a/.ignore"), "!*.tmp\n");
+        mats[1].refresh();
+        assert!(matchedf(&mut mats[1], "x.tmp").is_whitelist());
+        assert!(matchedf(&mut mats[0], "b/x.tmp").is_ignore());
+    }
+
+    // Test that a refresh surfaces parse errors from newly read ignore files
+    // (with the file path and line number), applies the valid rules from the
+    // same file, doesn't mix in stale rules, reports errors only once per
+    // load and recovers when the file is fixed and refreshed again.
+    #[test]
+    fn refresh_reports_errors_from_new_rules() {
+        let td = tmpdir();
+        let root = td.path().join("work");
+        mkdirp(&root);
+        wfile(td.path().join(".ignore"), "*.tmp\n");
+        wfile(root.join(".ignore"), "*.log\n");
+
+        let mut builder = builder(&root);
+        builder.git_ignore(false).git_exclude(false);
+        let mut m = one_matcher(&builder);
+        assert!(matchedf(&mut m, "x.tmp").is_ignore());
+        assert!(matchedf(&mut m, "x.log").is_ignore());
+
+        // Introduce invalid globs in both the parent and the root ignore
+        // files. Both errors are reported on the next query, with path and
+        // line number, while the valid rules apply and the stale ones don't.
+        wfile(td.path().join(".ignore"), "*.tmp\n{bad\n");
+        wfile(root.join(".ignore"), "{bad\n*.rs\n");
+        m.refresh();
+        let (matched, err) = m.matched_with_errors("x.rs", false);
+        assert!(matched.is_ignore());
+        let err = err.expect("expected parse errors");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(".ignore: line 2:"),
+            "parent error missing path and line: {msg}"
+        );
+        assert!(
+            msg.contains(".ignore: line 1:"),
+            "root error missing path and line: {msg}"
+        );
+        // The stale `*.log` rule from the root's old ignore file is gone,
+        // while the parent's (re-read, still valid) `*.tmp` rule applies.
+        assert!(matchedf(&mut m, "x.tmp").is_ignore());
+        assert!(matchedf(&mut m, "x.log").is_none());
+
+        // Errors from an already loaded file are not reported again.
+        let (_, err) = m.matched_with_errors("x.rs", false);
+        assert!(err.is_none(), "unexpected error: {err:?}");
+
+        // Fixing the files and refreshing clears the errors.
+        wfile(td.path().join(".ignore"), "*.tmp\n");
+        wfile(root.join(".ignore"), "*.rs\n");
+        m.refresh();
+        let (matched, err) = m.matched_with_errors("x.rs", false);
+        assert!(matched.is_ignore());
+        assert!(err.is_none(), "unexpected error: {err:?}");
+    }
+
+    // Test that refreshing the standard input matcher is a no-op.
+    #[test]
+    fn refresh_stdin_matcher_stays_inert() {
+        let mut m = one_matcher(&builder("-"));
+        assert!(matchedf(&mut m, "anything").is_none());
+        m.refresh();
+        assert!(matchedf(&mut m, "anything").is_none());
+        assert_eq!(m.normalize("anything"), None);
+    }
+
+    // Test that refreshing before the first query simply loads the current
+    // rules, and that refreshing a matcher whose root was missing re-checks
+    // for the root.
+    #[test]
+    fn refresh_before_first_use() {
+        let td = tmpdir();
+        let root = td.path().join("root");
+        mkdirp(&root);
+        wfile(root.join(".ignore"), "x.tmp\n");
+
+        let mut m = one_matcher(&builder(&root));
+        m.refresh();
+        assert!(matchedf(&mut m, "x.tmp").is_ignore());
+    }
+
+    // Test that a matcher whose root didn't exist when it was first queried
+    // picks the root up after a refresh.
+    #[test]
+    fn refresh_rechecks_missing_root() {
+        let td = tmpdir();
+        let root = td.path().join("root");
+
+        let mut m = one_matcher(&builder(&root));
+        assert!(matchedf(&mut m, "x.tmp").is_none());
+
+        mkdirp(&root);
+        wfile(root.join(".ignore"), "x.tmp\n");
+        // Without a refresh, the root is still treated as missing.
+        assert!(matchedf(&mut m, "x.tmp").is_none());
+        m.refresh();
+        assert!(matchedf(&mut m, "x.tmp").is_ignore());
     }
 }
