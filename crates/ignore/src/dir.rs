@@ -257,6 +257,23 @@ impl Ignore {
         (ig, errs.into_error_option())
     }
 
+    /// Return a copy of this matcher with a fresh, empty cache of compiled
+    /// parent directory matchers.
+    ///
+    /// The returned matcher shares this matcher's configuration and already
+    /// compiled matchers, but parent directory matchers compiled from here
+    /// on are neither read from nor written to the cache shared with other
+    /// matchers derived from the same builder. This permits reloading ignore
+    /// rules from disk for one matcher without affecting any other matcher.
+    pub(crate) fn refresh(&self) -> Ignore {
+        let mut inner = (*self.inner).clone();
+        inner.compiled = Arc::new(RwLock::new(HashMap::new()));
+        Ignore {
+            inner: Arc::new(inner),
+            absolute_base: self.absolute_base.clone(),
+        }
+    }
+
     /// Create a new `Ignore` matcher for the given child directory.
     ///
     /// Since building the matcher may require reading from multiple

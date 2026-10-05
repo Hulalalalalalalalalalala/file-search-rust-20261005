@@ -667,8 +667,9 @@ impl WalkBuilder {
     /// its parents, while later queries reuse the compiled matchers.
     /// Errors encountered while loading ignore files are returned by
     /// [`IncrementalIgnore::matched_with_errors`]. Once an ignore file has
-    /// been loaded, changes to it are not observed. Build new matchers to
-    /// reload changed ignore files.
+    /// been loaded, changes to it are not observed. Call
+    /// [`IncrementalIgnore::refresh`] to reload changed ignore files, or
+    /// build new matchers.
     ///
     /// Matchers built together share the builder's base ignore configuration
     /// and compiled parent matchers.
