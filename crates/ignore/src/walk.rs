@@ -669,7 +669,8 @@ impl WalkBuilder {
     /// [`IncrementalIgnore::matched_with_errors`]. Once an ignore file has
     /// been loaded, changes to it are not observed. Call
     /// [`IncrementalIgnore::refresh`] to reload changed ignore files, or
-    /// build new matchers.
+    /// [`IncrementalIgnore::refresh_dir`] to reload only one directory and
+    /// its descendants, or build new matchers.
     ///
     /// Matchers built together share the builder's base ignore configuration
     /// and compiled parent matchers.

@@ -29,7 +29,9 @@ use crate::{
 ///
 /// A matcher is a snapshot at directory granularity. Once the ignore files in
 /// a directory have been loaded, edits to those files are not observed. Call
-/// [`IncrementalIgnore::refresh`] to reload them, or build a new matcher.
+/// [`IncrementalIgnore::refresh`] to reload every directory, or
+/// [`IncrementalIgnore::refresh_dir`] to reload only one directory and its
+/// descendants, or build a new matcher.
 ///
 /// # Warning
 ///
@@ -190,6 +192,96 @@ impl IncrementalIgnore {
         }
         self.dirs.clear();
         self.ignore = RootIgnore::Unloaded(self.base.refresh());
+    }
+
+    /// Reload ignore rules from disk for one directory and its descendants.
+    ///
+    /// `dir` is a directory path relative to this matcher's
+    /// [root](IncrementalIgnore::root). Calling `refresh_dir` drops the
+    /// ignore rules and the allow/ignore decisions loaded for that directory
+    /// and every directory below it. This covers `.ignore`, `.gitignore`,
+    /// `.git/info/exclude` and any configured custom ignore files that were
+    /// added, modified or deleted, as well as the repository boundaries
+    /// (`.git` and `.jj` directories) used to decide whether git-related
+    /// rules apply. The first query that needs them reads the affected rules
+    /// from disk again, and they are then cached as usual until the next
+    /// refresh.
+    ///
+    /// Directories above `dir` keep the rules they have already loaded. In
+    /// particular, edits to ignore files in the search root or its parents
+    /// are not observed by refreshing a directory below them. Conversely,
+    /// only the named directory and its descendants are refreshed; sibling
+    /// directories are unaffected, even when their names share a common
+    /// prefix with `dir` (refreshing `src` does not refresh `src-old`).
+    ///
+    /// Like [`IncrementalIgnore::refresh`], this does not traverse the
+    /// directory tree and does not read any ignore files eagerly. The
+    /// directory may have been deleted or never visited by a previous
+    /// query; re-reading happens lazily, only when a later query needs it.
+    /// If a directory above `dir` is ignored by rules that were not
+    /// refreshed, then everything below it remains ignored and no ignore
+    /// files inside it are read.
+    ///
+    /// The empty path and a lone `.` designate the search root, making this
+    /// equivalent to [`IncrementalIgnore::refresh`], including reloading
+    /// the applicable ignore rules from parent directories outside the
+    /// root. `.` components elsewhere in `dir` are ignored.
+    ///
+    /// Only this matcher is refreshed. Clones of it made before the call
+    /// and other matchers built from the same [`crate::WalkBuilder`] keep
+    /// the rules they have already loaded, and a matcher for the special
+    /// `-` root representing standard input remains inert.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `dir` is absolute or contains a parent
+    /// directory (`..`) component. In that case, no matching state is
+    /// changed.
+    pub fn refresh_dir<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+    ) -> Result<(), Error> {
+        // Normalize the directory path, ignoring `.` components. Absolute
+        // paths and paths with `..` components are rejected before any
+        // matching state is touched.
+        let mut normalized = PathBuf::new();
+        for component in dir.as_ref().components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(c) => normalized.push(c),
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "refresh directory must be relative to the \
+                             search root and contain no `..` components, \
+                             but got {:?}",
+                            dir.as_ref(),
+                        ),
+                    );
+                    return Err(Error::from(err));
+                }
+            }
+        }
+        if matches!(self.ignore, RootIgnore::Stdin) {
+            return Ok(());
+        }
+        // The empty path (or a lone `.`) designates the search root, which
+        // is exactly what a full refresh reloads.
+        if normalized.as_os_str().is_empty() {
+            self.refresh();
+            return Ok(());
+        }
+        // Drop every cached decision at or below the directory. The cached
+        // matchers above it are retained, so later queries re-read the
+        // ignore files in the directory and its descendants lazily, while
+        // rules loaded from directories above it keep their current
+        // versions. `Path::starts_with` compares whole components, so a
+        // sibling like `src-old` is not matched by `src`.
+        self.dirs.retain(|path, _| !path.starts_with(&normalized));
+        Ok(())
     }
 
     /// Normalize `path` and return it relative to this matcher's root.
@@ -1711,5 +1803,312 @@ mod tests {
         let (mat, err) = m.matched_with_errors("foo", false);
         assert!(err.is_none(), "unexpected matcher error: {err:?}");
         assert!(mat.is_none());
+    }
+
+    // Tests that a directory refresh picks up edits in that directory, while
+    // rules loaded from directories above it keep their old versions.
+    #[test]
+    fn refresh_dir_picks_up_edits_below_dir_only() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join(".ignore"), "root-rule\n");
+        wfile(td.path().join("src/.ignore"), "src-rule\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "root-rule").is_ignore());
+        assert!(matchedf(&mut m, "src/src-rule").is_ignore());
+
+        wfile(td.path().join(".ignore"), "new-root-rule\n");
+        wfile(td.path().join("src/.ignore"), "new-src-rule\n");
+        m.refresh_dir("src").unwrap();
+        // The directory's own rules are reloaded...
+        assert!(matchedf(&mut m, "src/src-rule").is_none());
+        assert!(matchedf(&mut m, "src/new-src-rule").is_ignore());
+        // ... but the root rules loaded before the refresh are kept.
+        assert!(matchedf(&mut m, "root-rule").is_ignore());
+        assert!(matchedf(&mut m, "new-root-rule").is_none());
+    }
+
+    // Tests that refreshing a directory also reloads the ignore rules and
+    // allow/ignore decisions of every directory below it.
+    #[test]
+    fn refresh_dir_reloads_descendant_directories() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src/generated"));
+        wfile(td.path().join("src/.ignore"), "generated/\n");
+        wfile(td.path().join("src/generated/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/generated/foo").is_ignore());
+        assert!(matchedf(&mut m, "src/generated/bar").is_ignore());
+
+        // Drop the exclusion and refresh: the previously ignored directory
+        // is reconsidered and its own ignore rules are read.
+        wfile(td.path().join("src/.ignore"), "");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/generated/foo").is_ignore());
+        assert!(matchedf(&mut m, "src/generated/bar").is_none());
+    }
+
+    // Tests that a directory refresh is scoped by path components: a sibling
+    // directory whose name merely extends the refreshed name keeps its
+    // loaded rules.
+    #[test]
+    fn refresh_dir_does_not_touch_sibling_with_common_prefix() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        mkdirp(td.path().join("src-old"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+        wfile(td.path().join("src-old/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+        assert!(matchedf(&mut m, "src-old/foo").is_ignore());
+
+        wfile(td.path().join("src/.ignore"), "!foo\n");
+        wfile(td.path().join("src-old/.ignore"), "!foo\n");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_whitelist());
+        assert!(matchedf(&mut m, "src-old/foo").is_ignore());
+    }
+
+    // Tests that when a directory above the refreshed one is still ignored
+    // by unrefreshed rules, everything below stays ignored and no ignore
+    // files inside are read (so their parse errors are not reported).
+    #[test]
+    fn refresh_dir_keeps_blocking_rule_from_unrefreshed_parent() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join(".ignore"), "src/\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        // This whitelist is never read because the unrefreshed root rules
+        // still exclude src. Its parse error is not reported either.
+        wfile(td.path().join("src/.ignore"), "{invalid\n!foo\n");
+        m.refresh_dir("src").unwrap();
+        let (mat, err) = m.matched_with_errors("src/foo", false);
+        assert!(err.is_none(), "unexpected matcher error: {err:?}");
+        assert!(mat.is_ignore());
+    }
+
+    // Tests that a newly added blocking rule in the refreshed directory
+    // hides whitelist rules loaded below it before the refresh.
+    #[test]
+    fn refresh_dir_applies_newly_blocking_rule() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src/sub"));
+        wfile(td.path().join("src/sub/.ignore"), "!keep.rs\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/sub/keep.rs").is_whitelist());
+        assert!(matchedf(&mut m, "src/sub/other.rs").is_none());
+
+        wfile(td.path().join("src/.ignore"), "sub/\n");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/sub/keep.rs").is_ignore());
+        assert!(matchedf(&mut m, "src/sub/other.rs").is_ignore());
+    }
+
+    // Tests that the empty path and a lone `.` designate the search root,
+    // making the directory refresh equivalent to a full refresh, including
+    // reloading ignore rules from parent directories outside the root.
+    #[test]
+    fn refresh_dir_empty_and_dot_refresh_everything() {
+        let td = tmpdir();
+        let root = td.path().join("project");
+        mkdirp(&root);
+        wfile(td.path().join(".ignore"), "parent-rule\n");
+        wfile(root.join(".ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(&root));
+        assert!(matchedf(&mut m, "parent-rule").is_ignore());
+        assert!(matchedf(&mut m, "foo").is_ignore());
+
+        wfile(td.path().join(".ignore"), "new-parent-rule\n");
+        wfile(root.join(".ignore"), "!foo\n");
+        m.refresh_dir("").unwrap();
+        assert!(matchedf(&mut m, "parent-rule").is_none());
+        assert!(matchedf(&mut m, "new-parent-rule").is_ignore());
+        assert!(matchedf(&mut m, "foo").is_whitelist());
+
+        wfile(td.path().join(".ignore"), "parent-rule\n");
+        wfile(root.join(".ignore"), "foo\n");
+        m.refresh_dir(".").unwrap();
+        assert!(matchedf(&mut m, "parent-rule").is_ignore());
+        assert!(matchedf(&mut m, "foo").is_ignore());
+    }
+
+    // Tests that `.` components within a directory path are ignored.
+    #[test]
+    fn refresh_dir_ignores_dot_components() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        wfile(td.path().join("src/.ignore"), "!foo\n");
+        m.refresh_dir("./src/.").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_whitelist());
+    }
+
+    // Tests that a directory refresh accepts directories that were deleted
+    // or never visited by a previous query.
+    #[test]
+    fn refresh_dir_accepts_missing_or_unvisited_directories() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        // No query has happened yet, and `gone` doesn't even exist.
+        m.refresh_dir("src").unwrap();
+        m.refresh_dir("gone").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        // Deleting a cached directory and refreshing it is fine too.
+        std::fs::remove_dir_all(td.path().join("src")).unwrap();
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_none());
+    }
+
+    // Tests that a directory refresh observes configured custom ignore
+    // files and repository markers within the refreshed directory.
+    #[test]
+    fn refresh_dir_picks_up_custom_ignore_and_repo_markers() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+
+        let mut b = builder(td.path());
+        b.add_custom_ignore_filename(".rgignore");
+        let mut m = one_matcher(&b);
+        assert!(matchedf(&mut m, "src/foo").is_none());
+
+        wfile(td.path().join("src/.rgignore"), "foo\n");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        // A .gitignore inside src is inert until a repo marker appears.
+        wfile(td.path().join("src/.gitignore"), "bar\n");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/bar").is_none());
+        mkdirp(td.path().join("src/.git"));
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/bar").is_ignore());
+    }
+
+    // Tests that a query after a directory refresh reports parse errors
+    // from newly reread ignore files (with the file and line), applies the
+    // valid rules from those files, and doesn't report the same loaded
+    // error again until the next refresh.
+    #[test]
+    fn refresh_dir_reports_errors_from_reloaded_files() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        wfile(td.path().join("src/.ignore"), "{bad\nbar\n");
+        m.refresh_dir("src").unwrap();
+        let (mat, err) = m.matched_with_errors("src/bar", false);
+        let err = err.expect("expected a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".ignore") && msg.contains("line 1"),
+            "error should name the file and line: {msg}"
+        );
+        // The valid rule from the reloaded file applies...
+        assert!(mat.is_ignore());
+        // ... and the pre-refresh rule is gone. Since the file was already
+        // loaded, this query doesn't report the error again.
+        assert!(matchedf(&mut m, "src/foo").is_none());
+
+        // Fixing the file and refreshing again clears the old error.
+        wfile(td.path().join("src/.ignore"), "bar\n");
+        m.refresh_dir("src").unwrap();
+        let (mat, err) = m.matched_with_errors("src/bar", false);
+        assert!(err.is_none(), "unexpected matcher error: {err:?}");
+        assert!(mat.is_ignore());
+    }
+
+    // Tests that absolute paths and paths with `..` components are rejected
+    // without changing any matching state.
+    #[test]
+    fn refresh_dir_rejects_absolute_and_parent_paths() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+
+        wfile(td.path().join("src/.ignore"), "!foo\n");
+        let bad = [
+            td.path().join("src"),
+            PathBuf::from("/absolute"),
+            PathBuf::from("src/../src"),
+            PathBuf::from(".."),
+        ];
+        for path in &bad {
+            assert!(m.refresh_dir(path).is_err(), "expected error: {path:?}");
+        }
+        // The failed notifications changed nothing: the old rules and the
+        // cached decisions still apply.
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+    }
+
+    // Tests that a directory refresh doesn't affect clones made before the
+    // refresh.
+    #[test]
+    fn refresh_dir_does_not_affect_prior_clones() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src"));
+        wfile(td.path().join("src/.ignore"), "foo\n");
+
+        let mut m = one_matcher(&builder(td.path()));
+        assert!(matchedf(&mut m, "src/foo").is_ignore());
+        let mut clone = m.clone();
+
+        wfile(td.path().join("src/.ignore"), "!foo\n");
+        m.refresh_dir("src").unwrap();
+        assert!(matchedf(&mut m, "src/foo").is_whitelist());
+        assert!(matchedf(&mut clone, "src/foo").is_ignore());
+    }
+
+    // Tests that a directory refresh on one matcher doesn't affect other
+    // matchers built from the same builder, even with overlapping roots.
+    #[test]
+    fn refresh_dir_with_overlapping_roots_stays_isolated() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a/b"));
+        wfile(td.path().join("a/b/.ignore"), "foo\n");
+
+        let roots = [td.path().join("a"), td.path().join("a/b")];
+        let mut ms = matchers(&builders(roots));
+        assert!(matchedf(&mut ms[0], "b/foo").is_ignore());
+        assert!(matchedf(&mut ms[1], "foo").is_ignore());
+
+        wfile(td.path().join("a/b/.ignore"), "!foo\n");
+        ms[0].refresh_dir("b").unwrap();
+        assert!(matchedf(&mut ms[0], "b/foo").is_whitelist());
+        // The matcher for the nested root still uses the old rules.
+        assert!(matchedf(&mut ms[1], "foo").is_ignore());
+    }
+
+    // Tests that a matcher for standard input stays inert across a
+    // directory refresh.
+    #[test]
+    fn refresh_dir_keeps_stdin_matcher_inert() {
+        let mut m = one_matcher(&builder("-"));
+        m.refresh_dir("src").unwrap();
+        m.refresh_dir("").unwrap();
+        assert!(matchedf(&mut m, "anything").is_none());
+        assert_eq!(m.root(), Path::new("-"));
+        assert_eq!(m.normalize("anything"), None);
     }
 }
