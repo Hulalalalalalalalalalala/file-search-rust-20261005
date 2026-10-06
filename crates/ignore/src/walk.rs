@@ -593,7 +593,6 @@ impl WalkBuilder {
     pub fn build(&self) -> Walk {
         let follow_links = self.follow_links;
         let max_depth = self.max_depth;
-        let min_depth = self.min_depth;
         let sorter = self.sorter.clone();
         let its = self
             .paths
@@ -608,9 +607,11 @@ impl WalkBuilder {
                     if let Some(max_depth) = max_depth {
                         wd = wd.max_depth(max_depth);
                     }
-                    if let Some(min_depth) = min_depth {
-                        wd = wd.min_depth(min_depth);
-                    }
+                    // Note that the minimum depth is intentionally not
+                    // passed to WalkDir. Entries below the minimum depth
+                    // are filtered out by the iterator itself, so that
+                    // the directories traversed along the way still get
+                    // their ignore files loaded.
                     if let Some(ref sorter) = sorter {
                         match sorter.clone() {
                             Sorter::ByName(cmp) => {
@@ -637,6 +638,7 @@ impl WalkBuilder {
             ig_root: ig_root.clone(),
             ig: ig_root.clone(),
             max_depth: self.max_depth,
+            min_depth: self.min_depth,
             max_filesize: self.max_filesize,
             skip: self.skip.clone(),
             filter: self.filter.clone(),
@@ -1122,6 +1124,7 @@ pub struct Walk {
     ig_root: Ignore,
     ig: Ignore,
     max_depth: Option<usize>,
+    min_depth: Option<usize>,
     max_filesize: Option<u64>,
     skip: Option<Arc<Handle>>,
     filter: Option<Filter>,
@@ -1182,6 +1185,16 @@ impl Walk {
             }
         }
         Ok(false)
+    }
+
+    /// Returns true if and only if the given entry should be yielded to
+    /// the caller based on the minimum depth setting.
+    ///
+    /// Note that entries below the minimum depth are still processed
+    /// (e.g., their ignore files are loaded and their descendants are
+    /// visited); they just aren't yielded.
+    fn should_yield_entry(&self, ent: &DirEntry) -> bool {
+        self.min_depth.is_none_or(|min_depth| ent.depth() >= min_depth)
     }
 }
 
@@ -1245,6 +1258,17 @@ impl Iterator for Walk {
                     };
                     self.ig = igtmp;
                     ent.err = err;
+                    if !self.should_yield_entry(&ent) {
+                        // This entry is below the minimum depth, so it
+                        // isn't yielded. But an error from loading its
+                        // ignore files must not be lost, so yield it as
+                        // an error instead. (This happens at most once
+                        // for this directory.)
+                        if let Some(err) = ent.err {
+                            return Some(Err(err));
+                        }
+                        continue;
+                    }
                     return Some(Ok(ent));
                 }
                 Ok(WalkEvent::File(ent)) => {
@@ -1254,6 +1278,9 @@ impl Iterator for Walk {
                         Ok(should_skip) => should_skip,
                     };
                     if should_skip {
+                        continue;
+                    }
+                    if !self.should_yield_entry(&ent) {
                         continue;
                     }
                     return Some(Ok(ent));
@@ -1602,8 +1629,16 @@ impl Work {
     }
 
     /// Adds ignore rules for this directory without reading its contents.
+    ///
+    /// Since the contents of this directory will never be read (e.g.,
+    /// because the maximum depth has been reached), no descendants will
+    /// be visited and thus this directory's own ignore files cannot apply
+    /// to anything. So they aren't even parsed, which means, for example,
+    /// that a broken ignore file in a directory at the maximum depth does
+    /// not produce an error.
     fn add_ignore(&mut self) {
-        let (ig, err) = self.ignore.add_child(self.dent.path());
+        let (ig, err) =
+            self.ignore.add_child_with_entries(self.dent.path(), &[]);
         self.ignore = ig;
         self.dent.err = err;
     }
@@ -1822,6 +1857,15 @@ impl<'s> Worker<'s> {
         if should_visit {
             let state = self.visitor.visit(Ok(work.dent));
             if !state.is_continue() {
+                return state;
+            }
+        } else if let Some(err) = work.dent.err.take() {
+            // This entry is below the minimum depth, so it isn't
+            // yielded. But an error from loading its ignore files must
+            // not be lost, so yield it as an error instead. (This
+            // happens at most once for this directory.)
+            let state = self.visitor.visit(Err(err));
+            if state.is_quit() {
                 return state;
             }
         }
@@ -2500,6 +2544,195 @@ mod tests {
             builder.min_depth(Some(2)).max_depth(Some(1)),
             &["a/b", "a/foo"],
         );
+    }
+
+    #[test]
+    fn min_depth_applies_ignore_rules() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src/deep"));
+        mkdirp(td.path().join("blocked"));
+        wfile(td.path().join(".ignore"), "*.tmp\nblocked/\n");
+        wfile(td.path().join("src/.ignore"), "!keep.tmp\n");
+        wfile(td.path().join("src/keep.tmp"), "");
+        wfile(td.path().join("src/drop.tmp"), "");
+        wfile(td.path().join("src/deep/data.txt"), "");
+        // A whitelist inside an excluded directory must not
+        // resurrect its descendants.
+        wfile(td.path().join("blocked/.ignore"), "!data.txt\n");
+        wfile(td.path().join("blocked/data.txt"), "");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.min_depth(Some(2)).max_depth(Some(3));
+        assert_paths(
+            td.path(),
+            &builder,
+            &["src/deep", "src/deep/data.txt", "src/keep.tmp"],
+        );
+    }
+
+    #[test]
+    fn min_depth_applies_gitignore_rules() {
+        let td = tmpdir();
+        mkdirp(td.path().join(".git"));
+        mkdirp(td.path().join("src/deep"));
+        wfile(td.path().join(".gitignore"), "*.tmp\n");
+        wfile(td.path().join("src/.gitignore"), "!keep.tmp\n");
+        wfile(td.path().join("src/keep.tmp"), "");
+        wfile(td.path().join("src/drop.tmp"), "");
+        wfile(td.path().join("src/deep/data.txt"), "");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.min_depth(Some(2));
+        assert_paths(
+            td.path(),
+            &builder,
+            &["src/deep", "src/deep/data.txt", "src/keep.tmp"],
+        );
+    }
+
+    #[test]
+    fn min_depth_applies_custom_ignore_rules() {
+        let td = tmpdir();
+        mkdirp(td.path().join("src/deep"));
+        wfile(td.path().join(".customignore"), "*.tmp\n");
+        wfile(td.path().join("src/.customignore"), "!keep.tmp\n");
+        wfile(td.path().join("src/keep.tmp"), "");
+        wfile(td.path().join("src/drop.tmp"), "");
+        wfile(td.path().join("src/deep/data.txt"), "");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.add_custom_ignore_filename(".customignore");
+        builder.min_depth(Some(2));
+        assert_paths(
+            td.path(),
+            &builder,
+            &["src/deep", "src/deep/data.txt", "src/keep.tmp"],
+        );
+    }
+
+    #[test]
+    fn min_depth_ignore_rules_stay_within_branch() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a"));
+        mkdirp(td.path().join("b"));
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+        wfile(td.path().join("a/x.tmp"), "");
+        wfile(td.path().join("b/x.tmp"), "");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.min_depth(Some(2));
+        assert_paths(td.path(), &builder, &["b/x.tmp"]);
+    }
+
+    #[test]
+    fn min_depth_multiple_roots() {
+        let td = tmpdir();
+        mkdirp(td.path().join("a/sub"));
+        mkdirp(td.path().join("b/sub"));
+        wfile(td.path().join("a/.ignore"), "*.tmp\n");
+        wfile(td.path().join("a/sub/x.tmp"), "");
+        wfile(td.path().join("b/sub/x.tmp"), "");
+
+        let mut builder = WalkBuilder::new(td.path().join("a"));
+        builder.add(td.path().join("b"));
+        builder.min_depth(Some(2));
+        assert_paths(td.path(), &builder, &["b/sub/x.tmp"]);
+    }
+
+    #[test]
+    fn min_depth_reports_shallow_ignore_errors() {
+        let td = tmpdir();
+        mkdirp(td.path().join("sub"));
+        wfile(td.path().join("sub/.ignore"), "*.log\n{invalid\n");
+        wfile(td.path().join("sub/a.log"), "");
+        wfile(td.path().join("sub/b.txt"), "");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.min_depth(Some(2));
+
+        // The valid rules in the shallow directory still apply, and
+        // the parse error is reported exactly once through the
+        // iterator's error channel, with the ignore file's path and
+        // line number.
+        let mut paths = vec![];
+        let mut errs = vec![];
+        for result in builder.build() {
+            match result {
+                Ok(dent) => {
+                    let path = dent.path().strip_prefix(td.path()).unwrap();
+                    paths.push(normal_path(path.to_str().unwrap()));
+                }
+                Err(err) => errs.push(err.to_string()),
+            }
+        }
+        assert_eq!(paths, vec!["sub/b.txt".to_string()]);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("sub/.ignore"), "{}", errs[0]);
+        assert!(errs[0].contains("line 2"), "{}", errs[0]);
+
+        // The parallel walker reports the same paths and errors.
+        let paths = Arc::new(Mutex::new(vec![]));
+        let errs = Arc::new(Mutex::new(vec![]));
+        builder.build_parallel().run(|| {
+            let paths = paths.clone();
+            let errs = errs.clone();
+            Box::new(move |result| {
+                match result {
+                    Ok(dent) => {
+                        paths.lock().unwrap().push(dent);
+                    }
+                    Err(err) => {
+                        errs.lock().unwrap().push(err.to_string());
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+        let got_paths: Vec<String> = paths
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|dent| {
+                let path = dent.path().strip_prefix(td.path()).unwrap();
+                normal_path(path.to_str().unwrap())
+            })
+            .collect();
+        let got_errs = errs.lock().unwrap();
+        assert_eq!(got_paths, vec!["sub/b.txt".to_string()]);
+        assert_eq!(got_errs.len(), 1);
+        assert!(got_errs[0].contains("sub/.ignore"), "{}", got_errs[0]);
+        assert!(got_errs[0].contains("line 2"), "{}", got_errs[0]);
+    }
+
+    #[test]
+    fn max_depth_does_not_load_unreachable_ignore_files_parallel() {
+        let td = tmpdir();
+        let leaf = td.path().join("leaf");
+        mkdirp(&leaf);
+        wfile(leaf.join(".ignore"), "{invalid\n");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.max_depth(Some(1));
+        let dents = walk_collect_entries_parallel(&builder);
+        let entry = dents.iter().find(|dent| dent.path() == leaf).unwrap();
+        assert!(entry.error().is_none());
+    }
+
+    #[test]
+    fn max_depth_zero_does_not_load_ignore_files() {
+        let td = tmpdir();
+        wfile(td.path().join(".ignore"), "{invalid\n");
+
+        let mut builder = WalkBuilder::new(td.path());
+        builder.max_depth(Some(0));
+
+        let dents = builder.build().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(dents.len(), 1);
+        assert!(dents[0].error().is_none());
+
+        let dents = walk_collect_entries_parallel(&builder);
+        assert_eq!(dents.len(), 1);
+        assert!(dents[0].error().is_none());
     }
 
     #[test]
